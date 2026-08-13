@@ -146,6 +146,7 @@ function registrarPonto(token, tipo, latitude, longitude, userAgent, accuracy) {
         local: nearest.nome,
         hora: timestamp.slice(11),
         proximosTipos: getProximosTipos(normalizedType),
+        registro: { tipo: normalizedType, local_nome: String(nearest.nome), timestamp },
       };
     });
   } catch (error) {

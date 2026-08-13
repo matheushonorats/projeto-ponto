@@ -8,7 +8,8 @@ const S = {
   token:    sessionStorage.getItem('pt_token') || null,
   user:     JSON.parse(sessionStorage.getItem('pt_user') || 'null'),
   gps:      { lat: null, lng: null, accuracy: null, watchId: null },
-  nextTypes:[], localAtivo: null,
+  nextTypes:[], localAtivo: null, registrosHoje: [],
+  statusVersion: 0, isRegistering: false,
   allFuncs: [], allLocais: [],
   map: null, mapMarker: null, mapCircle: null,
 };
@@ -148,12 +149,17 @@ let _lastGpsCall = 0;
 async function onGPSOk(pos) {
   const { latitude: lat, longitude: lng, accuracy: acc } = pos.coords;
   S.gps.lat = lat; S.gps.lng = lng; S.gps.accuracy = acc;
+  if (S.isRegistering) return;
   const now = Date.now();
   // Throttle server calls to max 1 every 8s
   if (now - _lastGpsCall < 8000) { el('gps-acc').textContent = `±${Math.round(acc)}m`; return; }
   _lastGpsCall = now;
+  const requestVersion = S.statusVersion;
   try {
     const r = await api('getStatusFuncionario', S.token, lat, lng);
+    // A resposta pode chegar depois de um registro. Nesse caso ela descreve
+    // o estado anterior e não deve sobrescrever os botões nem a lista.
+    if (requestVersion !== S.statusVersion || S.isRegistering) return;
     if (!r.success) {
       if (r.error?.includes('Sessão')) { handleLogout(); return; }
       setGPS('error', r.error || 'Erro ao verificar área.'); setPunchBtns([]); return;
@@ -170,7 +176,8 @@ async function onGPSOk(pos) {
       setGPS('error', nearest ? `Fora da área — ${nearest.nome}: ${nearest.distancia}m` : 'Fora de todos os locais autorizados.');
       setPunchBtns([]);
     }
-    renderTodayList(r.registrosHoje);
+    S.registrosHoje = r.registrosHoje;
+    renderTodayList(S.registrosHoje);
   } catch(e) { /* ignore transient errors */ }
 }
 
@@ -194,6 +201,9 @@ function setPunchBtns(tipos) {
 
 async function registrarPonto(tipo) {
   if (!S.gps.lat) { showPunchFb('Aguardando GPS…', 'loading'); return; }
+  if (S.isRegistering) return;
+  S.isRegistering = true;
+  S.statusVersion += 1;
   setPunchBtns([]);
   showPunchFb('Registrando…', 'loading');
   try {
@@ -202,15 +212,22 @@ async function registrarPonto(tipo) {
       showPunchFb(`${r.message}\n${r.local} · ${r.hora}`, 'success');
       S.nextTypes = r.proximosTipos;
       setPunchBtns(r.proximosTipos);
+      if (r.registro) {
+        S.registrosHoje = [...S.registrosHoje, r.registro];
+        renderTodayList(S.registrosHoje);
+      }
+      S.isRegistering = false;
       _lastGpsCall = 0; // force GPS status refresh
       if (S.gps.lat) onGPSOk({ coords: { latitude: S.gps.lat, longitude: S.gps.lng, accuracy: 0 } });
     } else {
       showPunchFb(r.error, 'error');
       setPunchBtns(S.nextTypes);
+      S.isRegistering = false;
     }
   } catch(e) {
     showPunchFb('Erro de conexão.', 'error');
     setPunchBtns(S.nextTypes);
+    S.isRegistering = false;
   }
 }
 
