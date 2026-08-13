@@ -1,6 +1,7 @@
 .agents/
 node_modules/
 .clasprc.json
+.clasp.json
 .clasptmp*
 npm-debug.log*
 yarn-debug.log*
