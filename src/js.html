@@ -449,7 +449,8 @@ function initMap() {
   if (S.map) { S.map.remove(); }
   const defLat = -15.77972, defLng = -47.92972; // Brasília como centro padrão
   S.map = L.map('modal-map').setView([defLat, defLng], 12);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(S.map);
+  const tileUrl = ['https:', '', '{s}.tile.openstreetmap.org', '{z}', '{x}', '{y}.png'].join('/');
+  L.tileLayer(tileUrl, { attribution: '© OpenStreetMap' }).addTo(S.map);
 
   S.map.on('click', e => {
     const { lat, lng } = e.latlng;
