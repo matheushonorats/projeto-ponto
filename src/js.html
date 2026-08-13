@@ -267,9 +267,16 @@ async function initAdmin() {
 }
 
 function adminSection(sec) {
+  const navIds = {
+    dashboard: 'dash',
+    funcionarios: 'funcs',
+    locais: 'locais',
+    relatorio: 'rel',
+    configuracoes: 'config',
+  };
   ['dashboard','funcionarios','locais','relatorio','configuracoes'].forEach(s => {
     el('sec-'+s).classList.toggle('hidden', s !== sec);
-    el('nav-'+(s==='funcionarios'?'funcs':s==='configuracoes'?'config':s)).classList.toggle('active', s === sec);
+    el('nav-' + navIds[s]).classList.toggle('active', s === sec);
   });
   if (sec === 'relatorio') fillRelatorioSelects();
 }
