@@ -1,1 +1,9 @@
-.agents/ 
+.agents/
+node_modules/
+.clasprc.json
+.clasptmp*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db

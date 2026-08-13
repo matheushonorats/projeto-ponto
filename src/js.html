@@ -1,0 +1,590 @@
+<script>
+// ══════════════════════════════════════════════════════════
+// Projeto Ponto — Client JavaScript
+// ══════════════════════════════════════════════════════════
+
+/* ── State ──────────────────────────────────────────────── */
+const S = {
+  token:    sessionStorage.getItem('pt_token') || null,
+  user:     JSON.parse(sessionStorage.getItem('pt_user') || 'null'),
+  gps:      { lat: null, lng: null, watchId: null },
+  nextTypes:[], localAtivo: null,
+  allFuncs: [], allLocais: [],
+  map: null, mapMarker: null, mapCircle: null,
+};
+
+/* ── GAS caller ─────────────────────────────────────────── */
+function api(fn, ...args) {
+  return new Promise((ok, fail) =>
+    google.script.run.withSuccessHandler(ok).withFailureHandler(fail)[fn](...args)
+  );
+}
+
+/* ══ BOOTSTRAP ══════════════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded', async () => {
+  tickClock(); setInterval(tickClock, 1000);
+  try {
+    const fr = await api('checkFirstRun');
+    if (fr.firstRun) { show('setup'); return; }
+    if (S.token) {
+      const v = await api('validateToken', S.token);
+      if (v.valid) { enterApp(v.perfil, S.user?.nome); return; }
+    }
+  } catch(e) { /* offline or error — show login */ }
+  sessionStorage.clear(); S.token = null; S.user = null;
+  show('login');
+  loadVersion();
+});
+
+async function loadVersion() {
+  // Show version in footer if available
+  try {
+    const v = typeof APP_VERSION !== 'undefined' ? APP_VERSION : null;
+    if (v) document.getElementById('app-version-login').textContent = 'v' + v;
+  } catch(e) {}
+}
+
+function show(view) {
+  ['setup','login','app','admin'].forEach(v =>
+    document.getElementById('view-'+v).classList.toggle('hidden', v !== view)
+  );
+}
+
+function enterApp(perfil, nome) {
+  if (perfil === 'admin') {
+    show('admin');
+    initAdmin();
+  } else {
+    show('app');
+    document.getElementById('app-username').textContent = nome || '';
+    initGPS();
+  }
+}
+
+/* ══ CLOCK ══════════════════════════════════════════════════ */
+function tickClock() {
+  const n = new Date();
+  const t = document.getElementById('clock-time');
+  const d = document.getElementById('clock-date');
+  if (t) t.textContent = n.toLocaleTimeString('pt-BR');
+  if (d) d.textContent = n.toLocaleDateString('pt-BR', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+}
+
+/* ══ AUTH ═══════════════════════════════════════════════════ */
+
+async function handleSetup() {
+  const nome  = el('setup-nome').value.trim();
+  const email = el('setup-email').value.trim();
+  const senha = el('setup-senha').value;
+  const errEl = el('setup-error');
+  errEl.classList.add('hidden');
+  if (!nome || !email || !senha) { showMsg(errEl, 'Preencha todos os campos.', 'error'); return; }
+  setBtnLoading('btn-setup', true);
+  try {
+    const r = await api('criarAdminInicial', nome, email, senha);
+    if (!r.success) { showMsg(errEl, r.error, 'error'); return; }
+    toast('✅ ' + r.message);
+    show('login');
+  } catch(e) { showMsg(errEl, 'Erro de conexão.', 'error'); }
+  finally { setBtnLoading('btn-setup', false); }
+}
+
+async function handleLogin() {
+  const email = el('login-email').value.trim();
+  const senha = el('login-senha').value;
+  const errEl = el('login-error');
+  errEl.classList.add('hidden');
+  if (!email || !senha) { showMsg(errEl, 'Preencha e-mail e senha.', 'error'); return; }
+  setBtnLoading('btn-login', true);
+  try {
+    const r = await api('login', email, senha);
+    if (!r.success) { showMsg(errEl, r.error, 'error'); return; }
+    S.token = r.token; S.user = { nome: r.nome, perfil: r.perfil };
+    sessionStorage.setItem('pt_token', r.token);
+    sessionStorage.setItem('pt_user', JSON.stringify(S.user));
+    enterApp(r.perfil, r.nome);
+  } catch(e) { showMsg(errEl, 'Erro de conexão. Tente novamente.', 'error'); }
+  finally { setBtnLoading('btn-login', false); }
+}
+
+async function handleLogout() {
+  if (S.token) await api('logout', S.token).catch(()=>{});
+  if (S.gps.watchId) navigator.geolocation.clearWatch(S.gps.watchId);
+  sessionStorage.clear(); Object.assign(S, { token:null, user:null, gps:{lat:null,lng:null,watchId:null} });
+  show('login');
+}
+
+/* ── Password ─────────────────────────────────────────────── */
+function openAlterarSenha() { el('pw-msg').classList.add('hidden'); el('pw-atual').value=''; el('pw-nova').value=''; openModal('modal-pw'); }
+async function handleAlterarSenha() {
+  const atual = el('pw-atual').value;
+  const nova  = el('pw-nova').value;
+  const msgEl = el('pw-msg');
+  msgEl.classList.add('hidden');
+  try {
+    const r = await api('alterarSenha', S.token, atual, nova);
+    if (!r.success) { showMsg(msgEl, r.error, 'error'); return; }
+    showMsg(msgEl, r.message, 'success');
+    setTimeout(() => closeModal('modal-pw'), 1500);
+  } catch(e) { showMsg(msgEl, 'Erro de conexão.', 'error'); }
+}
+
+/* ══ GPS ════════════════════════════════════════════════════ */
+function initGPS() {
+  if (!navigator.geolocation) { setGPS('error', 'Geolocalização não suportada.'); return; }
+  setGPS('loading', 'Obtendo localização…');
+  S.gps.watchId = navigator.geolocation.watchPosition(onGPSOk, onGPSErr,
+    { enableHighAccuracy: true, maximumAge: 20000, timeout: 25000 });
+}
+
+let _lastGpsCall = 0;
+async function onGPSOk(pos) {
+  const { latitude: lat, longitude: lng, accuracy: acc } = pos.coords;
+  S.gps.lat = lat; S.gps.lng = lng;
+  const now = Date.now();
+  // Throttle server calls to max 1 every 8s
+  if (now - _lastGpsCall < 8000) { el('gps-acc').textContent = `±${Math.round(acc)}m`; return; }
+  _lastGpsCall = now;
+  try {
+    const r = await api('getStatusFuncionario', S.token, lat, lng);
+    if (!r.success) {
+      if (r.error?.includes('Sessão')) { handleLogout(); return; }
+      setGPS('error', r.error || 'Erro ao verificar área.'); setPunchBtns([]); return;
+    }
+    if (r.erro) { setGPS('error', r.erro); setPunchBtns([]); return; }
+    S.nextTypes  = r.proximosTipos;
+    S.localAtivo = r.localAtivo;
+    el('gps-acc').textContent = `±${Math.round(acc)}m`;
+    if (r.dentroDeArea && r.localAtivo) {
+      setGPS('ok', `✓ ${r.localAtivo.nome} (${r.localAtivo.distancia}m)`);
+      setPunchBtns(r.proximosTipos);
+    } else {
+      const nearest = [...r.locais].sort((a,b) => a.distancia - b.distancia)[0];
+      setGPS('error', nearest ? `Fora da área — ${nearest.nome}: ${nearest.distancia}m` : 'Fora de todos os locais autorizados.');
+      setPunchBtns([]);
+    }
+    renderTodayList(r.registrosHoje);
+  } catch(e) { /* ignore transient errors */ }
+}
+
+function onGPSErr(e) {
+  const msgs = { 1:'Permissão de localização negada.', 2:'GPS indisponível.', 3:'Timeout de GPS.' };
+  setGPS('error', msgs[e.code] || 'Erro de GPS.'); setPunchBtns([]);
+}
+
+function setGPS(type, label) {
+  el('gps-dot').className = 'gps-dot ' + type;
+  el('gps-label').textContent = label;
+}
+
+/* ══ PUNCH ══════════════════════════════════════════════════ */
+function setPunchBtns(tipos) {
+  ['entrada','pausa','retorno','saída'].forEach(t => {
+    const id = t === 'saída' ? 'btn-saida' : 'btn-' + t;
+    el(id).disabled = !tipos.includes(t);
+  });
+}
+
+async function registrarPonto(tipo) {
+  if (!S.gps.lat) { showPunchFb('Aguardando GPS…', 'loading'); return; }
+  setPunchBtns([]);
+  showPunchFb('Registrando…', 'loading');
+  try {
+    const r = await api('registrarPonto', S.token, tipo, S.gps.lat, S.gps.lng, navigator.userAgent);
+    if (r.success) {
+      showPunchFb(`✅ ${r.message}\n📍 ${r.local} · ${r.hora}`, 'success');
+      S.nextTypes = r.proximosTipos;
+      setPunchBtns(r.proximosTipos);
+      _lastGpsCall = 0; // force GPS status refresh
+      if (S.gps.lat) onGPSOk({ coords: { latitude: S.gps.lat, longitude: S.gps.lng, accuracy: 0 } });
+    } else {
+      showPunchFb(`❌ ${r.error}`, 'error');
+      setPunchBtns(S.nextTypes);
+    }
+  } catch(e) {
+    showPunchFb('Erro de conexão.', 'error');
+    setPunchBtns(S.nextTypes);
+  }
+}
+
+function showPunchFb(msg, type) {
+  const fb = el('punch-fb');
+  fb.className = 'punch-feedback ' + type;
+  fb.textContent = msg;
+  fb.classList.remove('hidden');
+  if (type === 'success') setTimeout(() => fb.classList.add('hidden'), 6000);
+}
+
+function renderTodayList(registros) {
+  const ul = el('today-list');
+  if (!registros?.length) { ul.innerHTML = '<p class="empty">Nenhum registro hoje.</p>'; return; }
+  ul.innerHTML = [...registros].reverse().map(r => `
+    <div class="record-item">
+      <div>
+        <div class="record-type ${r.tipo}">${cap(r.tipo)}</div>
+        <div class="record-meta">${esc(r.local_nome)}</div>
+      </div>
+      <div class="record-time">${String(r.timestamp).substring(11,16)}</div>
+    </div>`).join('');
+}
+
+/* ── Histórico modal ──────────────────────────────────────── */
+function openHistorico() {
+  const today = isoDate(new Date());
+  const week  = isoDate(new Date(Date.now() - 7*864e5));
+  el('hist-ini').value = week; el('hist-fim').value = today;
+  openModal('modal-hist'); loadHistorico();
+}
+async function loadHistorico() {
+  const list = el('hist-list');
+  list.innerHTML = '<p class="empty">Carregando…</p>';
+  try {
+    const r = await api('getMeusPontos', S.token, el('hist-ini').value, el('hist-fim').value);
+    if (!r.success) { list.innerHTML = `<p class="empty">${r.error}</p>`; return; }
+    if (!r.registros.length) { list.innerHTML = '<p class="empty">Nenhum registro no período.</p>'; return; }
+    list.innerHTML = r.registros.map(r => `
+      <div class="record-item">
+        <div>
+          <div class="record-type ${r.tipo}">${cap(r.tipo)}</div>
+          <div class="record-meta">${esc(r.local_nome)}</div>
+        </div>
+        <div class="record-time">${String(r.timestamp).substring(0,16)}</div>
+      </div>`).join('');
+  } catch(e) { list.innerHTML = '<p class="empty">Erro ao carregar.</p>'; }
+}
+
+/* ══ ADMIN ══════════════════════════════════════════════════ */
+async function initAdmin() {
+  adminSection('dashboard');
+  await loadDashboard();
+  await loadFuncsData();
+  await loadLocaisData();
+  loadConfiguracoes();
+}
+
+function adminSection(sec) {
+  ['dashboard','funcionarios','locais','relatorio','configuracoes'].forEach(s => {
+    el('sec-'+s).classList.toggle('hidden', s !== sec);
+    el('nav-'+(s==='funcionarios'?'funcs':s==='configuracoes'?'config':s)).classList.toggle('active', s === sec);
+  });
+  if (sec === 'relatorio') fillRelatorioSelects();
+}
+
+/* ── Dashboard ─────────────────────────────────────────────── */
+async function loadDashboard() {
+  try {
+    const r = await api('getDashboardStats', S.token);
+    if (!r.success) return;
+    el('st-func').textContent = r.funcionariosAtivos;
+    el('st-pres').textContent = r.presentesHoje;
+    el('st-regs').textContent = r.registrosHoje;
+    el('st-locs').textContent = r.locaisAtivos;
+  } catch(e) {}
+}
+
+/* ── Funcionários ──────────────────────────────────────────── */
+async function loadFuncsData() {
+  try {
+    const r = await api('getFuncionarios', S.token);
+    if (r.success) { S.allFuncs = r.funcionarios; renderFuncs(); }
+  } catch(e) {}
+}
+
+function renderFuncs() {
+  const tb = el('tbody-func');
+  if (!S.allFuncs.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">Nenhum funcionário.</td></tr>'; return; }
+  tb.innerHTML = S.allFuncs.map(f => `
+    <tr>
+      <td><strong>${esc(f.nome)}</strong></td>
+      <td>${esc(f.email)}</td>
+      <td><span class="badge ${f.perfil==='admin'?'bg-blue':'bg-gray'}">${f.perfil}</span></td>
+      <td><span class="badge ${f.ativo?'bg-green':'bg-red'}">${f.ativo?'Ativo':'Inativo'}</span></td>
+      <td><button class="btn ghost sm" onclick="openFuncModal('${f.id}',true)">Locais</button></td>
+      <td class="act-row">
+        <button class="btn secondary sm" onclick="openFuncModal('${f.id}')">Editar</button>
+        <button class="btn ghost sm" onclick="openResetPw('${f.id}','${esc(f.nome)}')">Senha</button>
+        <button class="btn ${f.ativo?'ghost':'primary'} sm" onclick="toggleFunc('${f.id}')">${f.ativo?'Desativar':'Ativar'}</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function openFuncModal(id = null, focusLocais = false) {
+  el('mf-msg').classList.add('hidden');
+  el('mf-id').value = '';
+  el('mf-nome').value = ''; el('mf-email').value = '';
+  el('mf-perfil').value = 'funcionario'; el('mf-ativo').value = 'true';
+  el('mf-senha').value = '';
+  el('mf-pw-lbl').textContent = 'Senha *';
+  el('mf-title').textContent = id ? 'Editar Funcionário' : 'Novo Funcionário';
+
+  // Locais checkboxes
+  el('mf-locais').innerHTML = S.allLocais.filter(l=>l.ativo).map(l => `
+    <label class="chip-item"><input type="checkbox" name="mf-loc" value="${l.id}"> ${esc(l.nome)}</label>
+  `).join('') || '<span class="empty">Nenhum local ativo cadastrado.</span>';
+
+  if (id) {
+    const f = S.allFuncs.find(x => String(x.id) === String(id));
+    if (f) {
+      el('mf-id').value = f.id; el('mf-nome').value = f.nome;
+      el('mf-email').value = f.email; el('mf-perfil').value = f.perfil;
+      el('mf-ativo').value = String(f.ativo);
+      el('mf-pw-lbl').textContent = 'Nova senha (deixe em branco para manter)';
+    }
+    try {
+      const locs = await api('getLocaisFuncionario', S.token, id);
+      if (locs.success) {
+        const ids = new Set(locs.local_ids.map(String));
+        document.querySelectorAll('[name="mf-loc"]').forEach(cb => { cb.checked = ids.has(String(cb.value)); });
+      }
+    } catch(e) {}
+  }
+  openModal('modal-func');
+  if (focusLocais) el('mf-locais').scrollIntoView({ behavior:'smooth', block:'center' });
+}
+
+function closeFuncModal() { closeModal('modal-func'); }
+
+async function salvarFuncionario() {
+  const id      = el('mf-id').value || null;
+  const nome    = el('mf-nome').value.trim();
+  const email   = el('mf-email').value.trim();
+  const perfil  = el('mf-perfil').value;
+  const ativo   = el('mf-ativo').value === 'true';
+  const senha   = el('mf-senha').value;
+  const locais  = [...document.querySelectorAll('[name="mf-loc"]:checked')].map(c=>c.value);
+  const msgEl   = el('mf-msg');
+  msgEl.classList.add('hidden');
+  try {
+    const r = await api('salvarFuncionario', S.token, { id, nome, email, perfil, ativo, senha });
+    if (!r.success) { showMsg(msgEl, r.error, 'error'); return; }
+    const funcId = id || r.id;
+    await api('setLocaisFuncionario', S.token, funcId, locais);
+    closeFuncModal();
+    toast('✅ ' + r.message);
+    loadFuncsData();
+  } catch(e) { showMsg(msgEl, 'Erro ao salvar.', 'error'); }
+}
+
+async function toggleFunc(id) {
+  try {
+    const r = await api('toggleFuncionario', S.token, id);
+    if (r.success) { toast(r.message); loadFuncsData(); }
+  } catch(e) { toast('Erro ao atualizar.'); }
+}
+
+/* ── Reset senha (admin) ───────────────────────────────────── */
+function openResetPw(id, nome) {
+  el('reset-pw-id').value = id;
+  el('reset-pw-nome').textContent = `Funcionário: ${nome}`;
+  el('reset-pw-nova').value = '';
+  el('reset-pw-msg').classList.add('hidden');
+  openModal('modal-reset-pw');
+}
+async function confirmarResetSenha() {
+  const id    = el('reset-pw-id').value;
+  const senha = el('reset-pw-nova').value;
+  const msgEl = el('reset-pw-msg');
+  msgEl.classList.add('hidden');
+  try {
+    const r = await api('resetSenhaFuncionario', S.token, id, senha);
+    if (!r.success) { showMsg(msgEl, r.error, 'error'); return; }
+    showMsg(msgEl, r.message, 'success');
+    setTimeout(() => closeModal('modal-reset-pw'), 1500);
+  } catch(e) { showMsg(msgEl, 'Erro ao redefinir.', 'error'); }
+}
+
+/* ── Locais ────────────────────────────────────────────────── */
+async function loadLocaisData() {
+  try {
+    const r = await api('getLocais', S.token);
+    if (r.success) { S.allLocais = r.locais; renderLocais(); }
+  } catch(e) {}
+}
+
+function renderLocais() {
+  const tb = el('tbody-locais');
+  if (!S.allLocais.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">Nenhum local.</td></tr>'; return; }
+  tb.innerHTML = S.allLocais.map(l => `
+    <tr>
+      <td><strong>${esc(l.nome)}</strong></td>
+      <td>${l.raio_metros}m</td>
+      <td style="font-family:monospace;font-size:.8rem">${Number(l.latitude).toFixed(6)}, ${Number(l.longitude).toFixed(6)}</td>
+      <td><span class="badge ${l.ativo?'bg-green':'bg-red'}">${l.ativo?'Ativo':'Inativo'}</span></td>
+      <td class="act-row">
+        <button class="btn secondary sm" onclick="openLocalModal('${l.id}')">Editar</button>
+        <button class="btn ${l.ativo?'ghost':'primary'} sm" onclick="toggleLocal('${l.id}')">${l.ativo?'Desativar':'Ativar'}</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function openLocalModal(id = null) {
+  el('ml-msg').classList.add('hidden');
+  el('ml-id').value = '';
+  el('ml-nome').value = ''; el('ml-lat').value = ''; el('ml-lng').value = ''; el('ml-raio').value = 150;
+  el('ml-title').textContent = id ? 'Editar Local' : 'Novo Local';
+  openModal('modal-local');
+  setTimeout(() => {
+    initMap();
+    if (id) {
+      const l = S.allLocais.find(x => String(x.id) === String(id));
+      if (l) {
+        el('ml-id').value = l.id; el('ml-nome').value = l.nome;
+        el('ml-lat').value = l.latitude; el('ml-lng').value = l.longitude; el('ml-raio').value = l.raio_metros;
+        setMapPin(parseFloat(l.latitude), parseFloat(l.longitude), parseInt(l.raio_metros));
+      }
+    }
+  }, 80);
+}
+
+function closeLocalModal() {
+  closeModal('modal-local');
+  if (S.map) { S.map.remove(); S.map = null; S.mapMarker = null; S.mapCircle = null; }
+}
+
+function initMap() {
+  if (S.map) { S.map.remove(); }
+  const defLat = -15.77972, defLng = -47.92972; // Brasília como centro padrão
+  S.map = L.map('modal-map').setView([defLat, defLng], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(S.map);
+
+  S.map.on('click', e => {
+    const { lat, lng } = e.latlng;
+    el('ml-lat').value = lat.toFixed(7); el('ml-lng').value = lng.toFixed(7);
+    setMapPin(lat, lng, parseInt(el('ml-raio').value) || 150);
+  });
+
+  el('ml-raio').addEventListener('input', () => {
+    if (S.mapCircle) S.mapCircle.setRadius(parseInt(el('ml-raio').value) || 150);
+  });
+}
+
+function setMapPin(lat, lng, raio) {
+  if (S.mapMarker) S.mapMarker.remove();
+  if (S.mapCircle) S.mapCircle.remove();
+  S.mapMarker = L.marker([lat, lng], { draggable: true }).addTo(S.map);
+  S.mapCircle = L.circle([lat, lng], { radius: raio, color:'#0ea5e9', fillColor:'#0ea5e9', fillOpacity:.15 }).addTo(S.map);
+  S.map.setView([lat, lng], 16);
+  S.mapMarker.on('dragend', e => {
+    const p = e.target.getLatLng();
+    el('ml-lat').value = p.lat.toFixed(7); el('ml-lng').value = p.lng.toFixed(7);
+    S.mapCircle.setLatLng(p);
+  });
+}
+
+async function salvarLocal() {
+  const id   = el('ml-id').value || null;
+  const nome = el('ml-nome').value.trim();
+  const lat  = el('ml-lat').value;
+  const lng  = el('ml-lng').value;
+  const raio = el('ml-raio').value;
+  const msgEl = el('ml-msg');
+  msgEl.classList.add('hidden');
+  try {
+    const r = await api('salvarLocal', S.token, { id, nome, latitude: lat, longitude: lng, raio_metros: raio });
+    if (!r.success) { showMsg(msgEl, r.error, 'error'); return; }
+    closeLocalModal();
+    toast('✅ ' + r.message);
+    loadLocaisData();
+  } catch(e) { showMsg(msgEl, 'Erro ao salvar.', 'error'); }
+}
+
+async function toggleLocal(id) {
+  try {
+    const r = await api('toggleLocal', S.token, id);
+    if (r.success) { toast(r.ativo ? 'Local ativado.' : 'Local desativado.'); loadLocaisData(); }
+  } catch(e) { toast('Erro ao atualizar.'); }
+}
+
+/* ── Relatório ─────────────────────────────────────────────── */
+function fillRelatorioSelects() {
+  const sf = el('rel-func'), sl = el('rel-local');
+  sf.innerHTML = '<option value="">Todos</option>' + S.allFuncs.map(f=>`<option value="${f.id}">${esc(f.nome)}</option>`).join('');
+  sl.innerHTML = '<option value="">Todos</option>' + S.allLocais.map(l=>`<option value="${l.id}">${esc(l.nome)}</option>`).join('');
+  if (!el('rel-ini').value) {
+    el('rel-fim').value = isoDate(new Date());
+    el('rel-ini').value = isoDate(new Date(Date.now() - 7*864e5));
+  }
+}
+
+async function loadRelatorio() {
+  const tb = el('tbody-rel');
+  tb.innerHTML = '<tr><td colspan="4" class="empty">Carregando…</td></tr>';
+  try {
+    const r = await api('getRelatorio', S.token, el('rel-ini').value, el('rel-fim').value, el('rel-func').value, el('rel-local').value);
+    if (!r.success) { tb.innerHTML = `<tr><td colspan="4" class="empty">${r.error}</td></tr>`; return; }
+    if (!r.registros.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">Nenhum registro.</td></tr>'; return; }
+    tb.innerHTML = r.registros.map(r => `
+      <tr>
+        <td style="white-space:nowrap">${String(r.timestamp).substring(0,16)}</td>
+        <td>${esc(r.nome)}</td>
+        <td>${esc(r.local_nome)}</td>
+        <td><span class="badge bg-${r.tipo}">${cap(r.tipo)}</span></td>
+      </tr>`).join('');
+  } catch(e) { tb.innerHTML = '<tr><td colspan="4" class="empty">Erro ao carregar.</td></tr>'; }
+}
+
+/* ── Configurações ─────────────────────────────────────────── */
+async function loadConfiguracoes() {
+  try {
+    const r = await api('getConfiguracoes', S.token);
+    if (!r.success) return;
+    if (r.config.sessao_duracao_horas) el('cfg-sessao').value = r.config.sessao_duracao_horas;
+    if (r.config.app_nome)             el('cfg-nome').value   = r.config.app_nome;
+  } catch(e) {}
+}
+
+async function salvarConfiguracoes() {
+  const msgEl = el('cfg-msg');
+  msgEl.classList.add('hidden');
+  try {
+    const sessao = el('cfg-sessao').value;
+    const nome   = el('cfg-nome').value.trim();
+    if (!sessao || parseInt(sessao) < 1) { showMsg(msgEl, 'Duração de sessão inválida.', 'error'); return; }
+    await api('salvarConfiguracao', S.token, 'sessao_duracao_horas', sessao);
+    if (nome) await api('salvarConfiguracao', S.token, 'app_nome', nome);
+    showMsg(msgEl, '✅ Configurações salvas!', 'success');
+  } catch(e) { showMsg(msgEl, 'Erro ao salvar.', 'error'); }
+}
+
+/* ══ MODAL HELPERS ══════════════════════════════════════════ */
+function openModal(id)  { el(id).classList.remove('hidden'); }
+function closeModal(id) { el(id).classList.add('hidden'); }
+
+/* ══ UTILS ══════════════════════════════════════════════════ */
+function el(id)      { return document.getElementById(id); }
+function cap(s)      { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
+function esc(s)      { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function isoDate(d)  { return d.toISOString().split('T')[0]; }
+
+function showMsg(el, msg, type) {
+  el.textContent = msg; el.className = 'msg ' + type; el.classList.remove('hidden');
+}
+
+function setBtnLoading(id, on) {
+  const btn = document.getElementById(id);
+  btn.disabled = on;
+  btn.querySelector('.btn-label').classList.toggle('hidden', on);
+  btn.querySelector('.btn-spin').classList.toggle('hidden', !on);
+}
+
+let _toastTm;
+function toast(msg) {
+  const t = el('toast');
+  t.textContent = msg; t.classList.remove('hidden');
+  clearTimeout(_toastTm);
+  _toastTm = setTimeout(() => t.classList.add('hidden'), 3000);
+}
+
+function togglePw(inputId, btn) {
+  const inp = el(inputId);
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  btn.textContent = inp.type === 'password' ? '👁' : '🙈';
+}
+
+// Enter key on login/setup forms
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  if (!el('view-login').classList.contains('hidden')) handleLogin();
+  if (!el('view-setup').classList.contains('hidden')) handleSetup();
+});
+</script>

@@ -1,0 +1,16 @@
+{
+  "name": "projeto-ponto",
+  "version": "1.0.0",
+  "description": "Sistema de Registro de Ponto com Geolocalização — Google Apps Script",
+  "scripts": {
+    "login": "clasp login",
+    "pull": "clasp pull",
+    "push": "clasp push",
+    "watch": "clasp push --watch",
+    "status": "clasp status",
+    "deploy": "node src/deploy-versionado.cjs"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.4.2"
+  }
+}
