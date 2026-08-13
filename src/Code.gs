@@ -119,6 +119,13 @@ function formatTimestamp(date) {
   return Utilities.formatDate(date || new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
 }
 
+function normalizeTimestamp(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return formatTimestamp(value);
+  }
+  return String(value || '');
+}
+
 function todayPrefix() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }

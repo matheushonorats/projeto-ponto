@@ -26,17 +26,17 @@ function getLocaisDoFuncionario(funcionarioId) {
 function getRegistrosHoje(funcionarioId) {
   return getData('Registros')
     .filter(record => String(record.funcionario_id) === String(funcionarioId)
-      && String(record.timestamp).startsWith(todayPrefix()))
-    .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+      && normalizeTimestamp(record.timestamp).startsWith(todayPrefix()))
+    .sort((a, b) => normalizeTimestamp(a.timestamp).localeCompare(normalizeTimestamp(b.timestamp)));
 }
 
 function filterRecords(records, startDate, endDate) {
   let result = records;
   if (startDate && /^\d{4}-\d{2}-\d{2}$/.test(String(startDate))) {
-    result = result.filter(record => String(record.timestamp) >= `${startDate} 00:00:00`);
+    result = result.filter(record => normalizeTimestamp(record.timestamp) >= `${startDate} 00:00:00`);
   }
   if (endDate && /^\d{4}-\d{2}-\d{2}$/.test(String(endDate))) {
-    result = result.filter(record => String(record.timestamp) <= `${endDate} 23:59:59`);
+    result = result.filter(record => normalizeTimestamp(record.timestamp) <= `${endDate} 23:59:59`);
   }
   return result;
 }
@@ -92,7 +92,7 @@ function getStatusFuncionario(token, latitude, longitude) {
       locais: locations,
       ultimoTipo: lastType,
       proximosTipos: getProximosTipos(lastType),
-      registrosHoje: records.map(record => ({ tipo: record.tipo, local_nome: record.local_nome, timestamp: record.timestamp })),
+      registrosHoje: records.map(record => ({ tipo: record.tipo, local_nome: record.local_nome, timestamp: normalizeTimestamp(record.timestamp) })),
     };
   } catch (error) {
     return { success: false, error: 'Não foi possível verificar sua localização.' };
@@ -161,7 +161,8 @@ function getMeusPontos(token, dataInicio, dataFim) {
     if (!user) return { success: false, error: 'Sessão inválida.' };
     const records = filterRecords(getData('Registros'), dataInicio, dataFim)
       .filter(record => String(record.funcionario_id) === String(user.id))
-      .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+      .sort((a, b) => normalizeTimestamp(b.timestamp).localeCompare(normalizeTimestamp(a.timestamp)))
+      .map(record => Object.assign({}, record, { timestamp: normalizeTimestamp(record.timestamp) }));
     return { success: true, registros: records.slice(0, 200) };
   } catch (error) {
     return { success: false, error: 'Não foi possível carregar o histórico.' };
