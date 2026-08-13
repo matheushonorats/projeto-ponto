@@ -1,184 +1,168 @@
 // ===================================================
-// Registros.gs — Attendance Registration & History
+// Registros.gs — Punch registration and history
 // ===================================================
 
-const TIPOS = ['entrada', 'pausa', 'retorno', 'saída'];
-
-const TIPO_LABELS = { entrada: 'Entrada', pausa: 'Pausa', retorno: 'Retorno', 'saída': 'Saída' };
+const TIPOS = Object.freeze(['entrada', 'pausa', 'retorno', 'saída']);
+const TIPO_LABELS = Object.freeze({ entrada: 'Entrada', pausa: 'Pausa', retorno: 'Retorno', 'saída': 'Saída' });
+const MAX_GPS_ACCURACY_METERS = 200;
 
 function getProximosTipos(ultimoTipo) {
-  switch (String(ultimoTipo || '').toLowerCase()) {
-    case 'entrada':  return ['pausa', 'saída'];
-    case 'pausa':    return ['retorno'];
-    case 'retorno':  return ['pausa', 'saída'];
-    case 'saída':    return ['entrada'];
-    default:         return ['entrada'];
-  }
+  const transitions = {
+    entrada: ['pausa', 'saída'],
+    pausa: ['retorno'],
+    retorno: ['pausa', 'saída'],
+    'saída': ['entrada'],
+  };
+  return transitions[String(ultimoTipo || '').toLowerCase()] || ['entrada'];
 }
 
 function getLocaisDoFuncionario(funcionarioId) {
-  const vinculos = getData('FuncionarioLocais')
-    .filter(v => String(v.funcionario_id) === String(funcionarioId));
-  const ids = new Set(vinculos.map(v => String(v.local_id)));
-  return getData('Locais').filter(l => ids.has(String(l.id)) && l.ativo === true);
+  const linkedIds = new Set(getData('FuncionarioLocais')
+    .filter(link => String(link.funcionario_id) === String(funcionarioId))
+    .map(link => String(link.local_id)));
+  return getData('Locais').filter(location => linkedIds.has(String(location.id)) && isActive(location.ativo));
 }
 
 function getRegistrosHoje(funcionarioId) {
-  const tz = Session.getScriptTimeZone();
-  const hoje = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-  return getData('Registros').filter(r =>
-    String(r.funcionario_id) === String(funcionarioId) &&
-    String(r.timestamp).startsWith(hoje)
-  );
+  return getData('Registros')
+    .filter(record => String(record.funcionario_id) === String(funcionarioId)
+      && String(record.timestamp).startsWith(todayPrefix()))
+    .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 }
 
-// ── Status: GPS check + today's state ────────────────────────
+function filterRecords(records, startDate, endDate) {
+  let result = records;
+  if (startDate && /^\d{4}-\d{2}-\d{2}$/.test(String(startDate))) {
+    result = result.filter(record => String(record.timestamp) >= `${startDate} 00:00:00`);
+  }
+  if (endDate && /^\d{4}-\d{2}-\d{2}$/.test(String(endDate))) {
+    result = result.filter(record => String(record.timestamp) <= `${endDate} 23:59:59`);
+  }
+  return result;
+}
+
+function locateEmployee(latitude, longitude, employeeId) {
+  let nearest = null;
+  getLocaisDoFuncionario(employeeId).forEach(location => {
+    const locationLat = parseCoordinate(location.latitude, -90, 90);
+    const locationLng = parseCoordinate(location.longitude, -180, 180);
+    const radius = Number(location.raio_metros);
+    if (locationLat === null || locationLng === null || !Number.isFinite(radius)) return;
+    const distance = haversineDistance(latitude, longitude, locationLat, locationLng);
+    const candidate = {
+      id: location.id,
+      nome: location.nome,
+      raio: Math.round(radius),
+      distancia: Math.round(distance),
+      dentro: distance <= radius,
+      source: location,
+    };
+    if (!nearest || candidate.distancia < nearest.distancia) nearest = candidate;
+  });
+  return nearest;
+}
 
 function getStatusFuncionario(token, latitude, longitude) {
   try {
     const user = getSessionUser(token);
     if (!user) return { success: false, error: 'Sessão inválida.' };
+    const lat = parseCoordinate(latitude, -90, 90);
+    const lng = parseCoordinate(longitude, -180, 180);
+    if (lat === null || lng === null) return { success: false, error: 'Localização inválida.' };
 
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
+    const locations = getLocaisDoFuncionario(user.id).map(location => {
+      const locationLat = parseCoordinate(location.latitude, -90, 90);
+      const locationLng = parseCoordinate(location.longitude, -180, 180);
+      const radius = Number(location.raio_metros);
+      const distance = locationLat === null || locationLng === null ? Infinity : haversineDistance(lat, lng, locationLat, locationLng);
+      return { id: location.id, nome: location.nome, raio: Math.round(radius), distancia: Math.round(distance), dentro: distance <= radius };
+    }).filter(location => Number.isFinite(location.distancia));
 
-    const locaisAutorizados = getLocaisDoFuncionario(user.id);
-    if (locaisAutorizados.length === 0) {
+    if (locations.length === 0) {
+      return { success: true, dentroDeArea: false, locais: [], ultimoTipo: null, proximosTipos: [], registrosHoje: [], erro: 'Nenhum local de trabalho configurado.' };
+    }
+
+    const records = getRegistrosHoje(user.id);
+    const lastType = records.length ? records[records.length - 1].tipo : null;
+    const activeLocation = locations.filter(location => location.dentro).sort((a, b) => a.distancia - b.distancia)[0] || null;
+    return {
+      success: true,
+      dentroDeArea: Boolean(activeLocation),
+      localAtivo: activeLocation,
+      locais: locations,
+      ultimoTipo: lastType,
+      proximosTipos: getProximosTipos(lastType),
+      registrosHoje: records.map(record => ({ tipo: record.tipo, local_nome: record.local_nome, timestamp: record.timestamp })),
+    };
+  } catch (error) {
+    return { success: false, error: 'Não foi possível verificar sua localização.' };
+  }
+}
+
+function registrarPonto(token, tipo, latitude, longitude, userAgent, accuracy) {
+  try {
+    const normalizedType = String(tipo || '').toLowerCase();
+    if (!TIPOS.includes(normalizedType)) return { success: false, error: 'Tipo de registro inválido.' };
+    const lat = parseCoordinate(latitude, -90, 90);
+    const lng = parseCoordinate(longitude, -180, 180);
+    const gpsAccuracy = Number(accuracy);
+    if (lat === null || lng === null) return { success: false, error: 'Coordenadas GPS inválidas.' };
+    if (Number.isFinite(gpsAccuracy) && gpsAccuracy > MAX_GPS_ACCURACY_METERS) {
+      return { success: false, error: 'A precisão do GPS está baixa. Aguarde uma leitura melhor e tente novamente.' };
+    }
+
+    return withScriptLock(() => {
+      const user = getSessionUser(token);
+      if (!user) return { success: false, error: 'Sessão inválida. Entre novamente.' };
+      const nearest = locateEmployee(lat, lng, user.id);
+      if (!nearest) return { success: false, error: 'Nenhum local autorizado configurado.' };
+      if (!nearest.dentro) return { success: false, error: 'Você está fora da área de trabalho autorizada.' };
+
+      const records = getRegistrosHoje(user.id);
+      const lastType = records.length ? records[records.length - 1].tipo : null;
+      const allowedTypes = getProximosTipos(lastType);
+      if (!allowedTypes.includes(normalizedType)) {
+        return { success: false, error: `Ação inválida. Próximo registro: ${allowedTypes.map(item => TIPO_LABELS[item]).join(' ou ')}.` };
+      }
+
+      const now = new Date();
+      const timestamp = formatTimestamp(now);
+      appendRow('Registros', {
+        id: `R${Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyyMMddHHmmss')}-${Utilities.getUuid().slice(0, 8).toUpperCase()}`,
+        funcionario_id: user.id,
+        nome: String(user.nome).slice(0, 120),
+        local_id: nearest.id,
+        local_nome: String(nearest.nome).slice(0, 120),
+        tipo: normalizedType,
+        latitude: lat,
+        longitude: lng,
+        timestamp,
+        dispositivo: String(userAgent || '').replace(/[\r\n\t]/g, ' ').slice(0, 200),
+      });
+
       return {
         success: true,
-        dentroDeArea: false,
-        locais: [],
-        ultimoTipo: null,
-        proximosTipos: [],
-        registrosHoje: [],
-        erro: 'Nenhum local de trabalho configurado. Contate o administrador.',
-      };
-    }
-
-    const locaisComDistancia = locaisAutorizados.map(l => {
-      const distancia = Math.round(haversineDistance(lat, lng, parseFloat(l.latitude), parseFloat(l.longitude)));
-      return {
-        id: l.id,
-        nome: l.nome,
-        raio: parseInt(l.raio_metros),
-        distancia,
-        dentro: distancia <= parseInt(l.raio_metros),
+        message: `${TIPO_LABELS[normalizedType]} registrada.`,
+        local: nearest.nome,
+        hora: timestamp.slice(11),
+        proximosTipos: getProximosTipos(normalizedType),
       };
     });
-
-    const dentroDeArea = locaisComDistancia.some(l => l.dentro);
-    const localAtivo = locaisComDistancia.filter(l => l.dentro).sort((a, b) => a.distancia - b.distancia)[0] || null;
-
-    const registrosHoje = getRegistrosHoje(user.id);
-    const ultimoTipo = registrosHoje.length > 0 ? registrosHoje[registrosHoje.length - 1].tipo : null;
-
-    return {
-      success: true,
-      dentroDeArea,
-      localAtivo,
-      locais: locaisComDistancia,
-      ultimoTipo,
-      proximosTipos: getProximosTipos(ultimoTipo),
-      registrosHoje: registrosHoje.map(r => ({
-        tipo: r.tipo,
-        local_nome: r.local_nome,
-        timestamp: r.timestamp,
-      })),
-    };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    console.error('registrarPonto', error);
+    return { success: false, error: 'Não foi possível registrar o ponto.' };
   }
 }
-
-// ── Register punch ────────────────────────────────────────────
-
-function registrarPonto(token, tipo, latitude, longitude, userAgent) {
-  try {
-    const user = getSessionUser(token);
-    if (!user) return { success: false, error: 'Sessão inválida. Faça login novamente.' };
-
-    tipo = String(tipo).toLowerCase();
-    if (!TIPOS.includes(tipo)) return { success: false, error: 'Tipo de registro inválido.' };
-
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
-    if (isNaN(lat) || isNaN(lng)) return { success: false, error: 'Coordenadas GPS inválidas.' };
-
-    // Find nearest authorized location within radius
-    const locaisAutorizados = getLocaisDoFuncionario(user.id);
-    if (locaisAutorizados.length === 0) {
-      return { success: false, error: 'Nenhum local autorizado configurado. Contate o administrador.' };
-    }
-
-    let localEncontrado = null;
-    let menorDist = Infinity;
-    for (const local of locaisAutorizados) {
-      const dist = haversineDistance(lat, lng, parseFloat(local.latitude), parseFloat(local.longitude));
-      if (dist <= parseFloat(local.raio_metros) && dist < menorDist) {
-        menorDist = dist;
-        localEncontrado = local;
-      }
-    }
-
-    if (!localEncontrado) {
-      return { success: false, error: 'Você está fora da área de trabalho autorizada.' };
-    }
-
-    // Validate sequence
-    const registrosHoje = getRegistrosHoje(user.id);
-    const ultimoTipo = registrosHoje.length > 0 ? registrosHoje[registrosHoje.length - 1].tipo : null;
-    const tiposPermitidos = getProximosTipos(ultimoTipo);
-
-    if (!tiposPermitidos.includes(tipo)) {
-      const esperados = tiposPermitidos.map(t => TIPO_LABELS[t]).join(' ou ');
-      return { success: false, error: `Ação inválida. Esperado: ${esperados}.` };
-    }
-
-    // Save
-    const tz = Session.getScriptTimeZone();
-    const id = 'R' + Utilities.formatDate(new Date(), tz, 'yyyyMMddHHmmss') + '-' + Utilities.getUuid().substring(0, 4).toUpperCase();
-    const timestamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
-
-    appendRow('Registros', {
-      id,
-      funcionario_id: user.id,
-      nome: user.nome,
-      local_id: localEncontrado.id,
-      local_nome: localEncontrado.nome,
-      tipo,
-      latitude: lat,
-      longitude: lng,
-      timestamp,
-      dispositivo: (userAgent || '').substring(0, 150),
-    });
-
-    return {
-      success: true,
-      message: `${TIPO_LABELS[tipo]} registrada!`,
-      local: localEncontrado.nome,
-      hora: timestamp.split(' ')[1],
-      proximosTipos: getProximosTipos(tipo),
-    };
-  } catch (e) {
-    Logger.log('registrarPonto error: ' + e.stack);
-    return { success: false, error: 'Erro ao registrar: ' + e.message };
-  }
-}
-
-// ── Employee history ──────────────────────────────────────────
 
 function getMeusPontos(token, dataInicio, dataFim) {
   try {
     const user = getSessionUser(token);
     if (!user) return { success: false, error: 'Sessão inválida.' };
-
-    let registros = getData('Registros').filter(r => String(r.funcionario_id) === String(user.id));
-    if (dataInicio) registros = registros.filter(r => String(r.timestamp) >= dataInicio);
-    if (dataFim)    registros = registros.filter(r => String(r.timestamp) <= dataFim + ' 23:59:59');
-
-    registros.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
-    return { success: true, registros: registros.slice(0, 200) };
-  } catch (e) {
-    return { success: false, error: e.message };
+    const records = filterRecords(getData('Registros'), dataInicio, dataFim)
+      .filter(record => String(record.funcionario_id) === String(user.id))
+      .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    return { success: true, registros: records.slice(0, 200) };
+  } catch (error) {
+    return { success: false, error: 'Não foi possível carregar o histórico.' };
   }
 }

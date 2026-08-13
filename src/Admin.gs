@@ -1,247 +1,272 @@
 // ===================================================
-// Admin.gs — Admin Panel Operations
+// Admin.gs — Administrative operations
 // ===================================================
-
-// ── Dashboard ────────────────────────────────────────────────
 
 function getDashboardStats(token) {
   try {
     requireAdmin(token);
-    const tz = Session.getScriptTimeZone();
-    const hoje = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-    const registros = getData('Registros');
-    const registrosHoje = registros.filter(r => String(r.timestamp).startsWith(hoje));
-    const funcionarios = getData('Funcionarios');
-    const locais = getData('Locais');
+    const todayRecords = getData('Registros')
+      .filter(record => String(record.timestamp).startsWith(todayPrefix()))
+      .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+
+    const lastTypeByEmployee = new Map();
+    todayRecords.forEach(record => lastTypeByEmployee.set(String(record.funcionario_id), record.tipo));
+    const presentCount = [...lastTypeByEmployee.values()].filter(type => type !== 'saída').length;
 
     return {
       success: true,
-      funcionariosAtivos: funcionarios.filter(f => f.ativo === true && f.perfil === 'funcionario').length,
-      locaisAtivos: locais.filter(l => l.ativo === true).length,
-      registrosHoje: registrosHoje.length,
-      presentesHoje: new Set(registrosHoje.filter(r => r.tipo === 'entrada').map(r => r.funcionario_id)).size,
+      funcionariosAtivos: getData('Funcionarios').filter(user => isActive(user.ativo) && user.perfil === 'funcionario').length,
+      locaisAtivos: getData('Locais').filter(location => isActive(location.ativo)).length,
+      registrosHoje: todayRecords.length,
+      presentesHoje: presentCount,
     };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
-
-// ── Funcionários ─────────────────────────────────────────────
 
 function getFuncionarios(token) {
   try {
     requireAdmin(token);
-    const list = getData('Funcionarios').map(f => ({
-      id: f.id, nome: f.nome, email: f.email,
-      perfil: f.perfil, ativo: f.ativo, criado_em: f.criado_em,
+    const funcionarios = getData('Funcionarios').map(user => ({
+      id: user.id,
+      nome: user.nome,
+      email: user.email,
+      perfil: user.perfil,
+      ativo: isActive(user.ativo),
+      criado_em: user.criado_em,
     }));
-    list.sort((a, b) => String(a.nome).localeCompare(String(b.nome), 'pt'));
-    return { success: true, funcionarios: list };
-  } catch (e) {
-    return { success: false, error: e.message };
+    funcionarios.sort((a, b) => String(a.nome).localeCompare(String(b.nome), 'pt-BR'));
+    return { success: true, funcionarios };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 function salvarFuncionario(token, dados) {
   try {
-    requireAdmin(token);
-    const { id, nome, email, perfil, senha, ativo } = dados;
-    if (!nome || !email) return { success: false, error: 'Nome e e-mail são obrigatórios.' };
-    if (!['funcionario', 'admin'].includes(perfil)) return { success: false, error: 'Perfil inválido.' };
+    const actor = requireAdmin(token);
+    const input = dados || {};
+    const name = String(input.nome || '').trim();
+    const email = normalizeEmail(input.email);
+    const profile = String(input.perfil || '');
 
-    const emailNorm = email.toLowerCase().trim();
-    const todos = getData('Funcionarios');
+    if (!name || name.length > 120 || !isValidEmail(email)) return { success: false, error: 'Informe nome e e-mail válidos.' };
+    if (!['funcionario', 'admin'].includes(profile)) return { success: false, error: 'Perfil inválido.' };
+    if (input.senha) {
+      const passwordError = validatePassword(input.senha);
+      if (passwordError) return { success: false, error: passwordError };
+    }
 
-    if (id) {
-      // Update
-      const dup = todos.find(f => f.email.toLowerCase().trim() === emailNorm && String(f.id) !== String(id));
-      if (dup) return { success: false, error: 'E-mail já cadastrado para outro funcionário.' };
-      const found = findRow('Funcionarios', 'id', id);
-      if (!found) return { success: false, error: 'Funcionário não encontrado.' };
-      const updates = { nome: nome.trim(), email: emailNorm, perfil, ativo: ativo !== false };
-      if (senha && senha.length >= 6) updates.senha_hash = hashPassword(senha);
-      else if (senha && senha.length > 0) return { success: false, error: 'Senha deve ter pelo menos 6 caracteres.' };
-      updateRowAt('Funcionarios', found.rowIndex, updates);
-      return { success: true, message: 'Funcionário atualizado com sucesso!' };
-    } else {
-      // Create
-      if (todos.find(f => f.email.toLowerCase().trim() === emailNorm)) {
-        return { success: false, error: 'E-mail já cadastrado.' };
+    return withScriptLock(() => {
+      const users = getData('Funcionarios');
+      const duplicate = users.some(user => normalizeEmail(user.email) === email && String(user.id) !== String(input.id || ''));
+      if (duplicate) return { success: false, error: 'E-mail já cadastrado.' };
+
+      if (input.id) {
+        const found = findRow('Funcionarios', 'id', input.id);
+        if (!found) return { success: false, error: 'Funcionário não encontrado.' };
+        const willBeActive = input.ativo !== false;
+        const removingAdmin = found.obj.perfil === 'admin' && (profile !== 'admin' || !willBeActive);
+        if (removingAdmin && activeAdminCount(users) <= 1) {
+          return { success: false, error: 'O sistema precisa manter ao menos um administrador ativo.' };
+        }
+
+        const updates = { nome: name, email, perfil: profile, ativo: willBeActive };
+        if (input.senha) updates.senha_hash = hashPassword(input.senha);
+        updateRowAt('Funcionarios', found.rowIndex, updates);
+        if (input.senha || !willBeActive || profile !== found.obj.perfil) invalidateUserSessionsUnsafe(found.obj.id);
+        return { success: true, message: 'Funcionário atualizado.' };
       }
-      if (!senha || senha.length < 6) return { success: false, error: 'Senha deve ter pelo menos 6 caracteres.' };
-      const tz = Session.getScriptTimeZone();
-      const newId = 'F' + Utilities.formatDate(new Date(), tz, 'yyMMdd') + '-' + Utilities.getUuid().substring(0, 6).toUpperCase();
+
+      const passwordError = validatePassword(input.senha);
+      if (passwordError) return { success: false, error: passwordError };
+      const id = `F${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyMMdd')}-${Utilities.getUuid().slice(0, 6).toUpperCase()}`;
       appendRow('Funcionarios', {
-        id: newId, nome: nome.trim(), email: emailNorm,
-        senha_hash: hashPassword(senha), perfil, ativo: true,
+        id,
+        nome: name,
+        email,
+        senha_hash: hashPassword(input.senha),
+        perfil: profile,
+        ativo: true,
         criado_em: new Date().toISOString(),
       });
-      return { success: true, message: 'Funcionário cadastrado com sucesso!', id: newId };
-    }
-  } catch (e) {
-    return { success: false, error: e.message };
+      return { success: true, message: 'Funcionário cadastrado.', id };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
+}
+
+function activeAdminCount(users) {
+  return users.filter(user => user.perfil === 'admin' && isActive(user.ativo)).length;
 }
 
 function toggleFuncionario(token, id) {
   try {
-    requireAdmin(token);
-    const found = findRow('Funcionarios', 'id', id);
-    if (!found) return { success: false, error: 'Funcionário não encontrado.' };
-    const novoStatus = !found.obj.ativo;
-    updateRowAt('Funcionarios', found.rowIndex, { ativo: novoStatus });
-    return { success: true, ativo: novoStatus, message: novoStatus ? 'Funcionário ativado.' : 'Funcionário desativado.' };
-  } catch (e) {
-    return { success: false, error: e.message };
+    const actor = requireAdmin(token);
+    return withScriptLock(() => {
+      const users = getData('Funcionarios');
+      const found = findRow('Funcionarios', 'id', id);
+      if (!found) return { success: false, error: 'Funcionário não encontrado.' };
+      const newStatus = !isActive(found.obj.ativo);
+      if (!newStatus && found.obj.perfil === 'admin' && activeAdminCount(users) <= 1) {
+        return { success: false, error: 'O último administrador ativo não pode ser desativado.' };
+      }
+      updateRowAt('Funcionarios', found.rowIndex, { ativo: newStatus });
+      if (!newStatus) invalidateUserSessionsUnsafe(found.obj.id);
+      return { success: true, ativo: newStatus, message: newStatus ? 'Funcionário ativado.' : 'Funcionário desativado.' };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 function resetSenhaFuncionario(token, funcionarioId, novaSenha) {
   try {
     requireAdmin(token);
-    if (!novaSenha || novaSenha.length < 6) return { success: false, error: 'Senha deve ter pelo menos 6 caracteres.' };
-    const found = findRow('Funcionarios', 'id', funcionarioId);
-    if (!found) return { success: false, error: 'Funcionário não encontrado.' };
-    updateRowAt('Funcionarios', found.rowIndex, { senha_hash: hashPassword(novaSenha) });
-    return { success: true, message: 'Senha redefinida com sucesso!' };
-  } catch (e) {
-    return { success: false, error: e.message };
+    const passwordError = validatePassword(novaSenha);
+    if (passwordError) return { success: false, error: passwordError };
+    return withScriptLock(() => {
+      const found = findRow('Funcionarios', 'id', funcionarioId);
+      if (!found) return { success: false, error: 'Funcionário não encontrado.' };
+      updateRowAt('Funcionarios', found.rowIndex, { senha_hash: hashPassword(novaSenha) });
+      invalidateUserSessionsUnsafe(funcionarioId);
+      return { success: true, message: 'Senha redefinida. As sessões anteriores foram encerradas.' };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
-
-// ── Locais ───────────────────────────────────────────────────
 
 function getLocais(token) {
   try {
     requireAdmin(token);
-    const locais = getData('Locais');
-    locais.sort((a, b) => String(a.nome).localeCompare(String(b.nome), 'pt'));
+    const locais = getData('Locais').map(location => ({ ...location, ativo: isActive(location.ativo) }));
+    locais.sort((a, b) => String(a.nome).localeCompare(String(b.nome), 'pt-BR'));
     return { success: true, locais };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 function salvarLocal(token, dados) {
   try {
     requireAdmin(token);
-    const { id, nome, latitude, longitude, raio_metros } = dados;
-    if (!nome) return { success: false, error: 'Nome do local é obrigatório.' };
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
-    const raio = parseInt(raio_metros);
-    if (isNaN(lat) || isNaN(lng)) return { success: false, error: 'Clique no mapa para definir as coordenadas.' };
-    if (isNaN(raio) || raio < 10) return { success: false, error: 'Raio mínimo é 10 metros.' };
-    if (raio > 10000) return { success: false, error: 'Raio máximo é 10.000 metros.' };
+    const input = dados || {};
+    const name = String(input.nome || '').trim();
+    const latitude = parseCoordinate(input.latitude, -90, 90);
+    const longitude = parseCoordinate(input.longitude, -180, 180);
+    const radius = Number(input.raio_metros);
+    if (!name || name.length > 120) return { success: false, error: 'Informe um nome válido.' };
+    if (latitude === null || longitude === null) return { success: false, error: 'Coordenadas inválidas.' };
+    if (!Number.isInteger(radius) || radius < 10 || radius > 10000) return { success: false, error: 'O raio deve estar entre 10 e 10.000 metros.' };
 
-    if (id) {
-      const found = findRow('Locais', 'id', id);
-      if (!found) return { success: false, error: 'Local não encontrado.' };
-      updateRowAt('Locais', found.rowIndex, { nome: nome.trim(), latitude: lat, longitude: lng, raio_metros: raio });
-      return { success: true, message: 'Local atualizado com sucesso!' };
-    } else {
-      const tz = Session.getScriptTimeZone();
-      const newId = 'L' + Utilities.formatDate(new Date(), tz, 'yyMMdd') + '-' + Utilities.getUuid().substring(0, 6).toUpperCase();
-      appendRow('Locais', {
-        id: newId, nome: nome.trim(), latitude: lat, longitude: lng,
-        raio_metros: raio, ativo: true, criado_em: new Date().toISOString(),
-      });
-      return { success: true, message: 'Local cadastrado com sucesso!', id: newId };
-    }
-  } catch (e) {
-    return { success: false, error: e.message };
+    return withScriptLock(() => {
+      if (input.id) {
+        const found = findRow('Locais', 'id', input.id);
+        if (!found) return { success: false, error: 'Local não encontrado.' };
+        updateRowAt('Locais', found.rowIndex, { nome: name, latitude, longitude, raio_metros: radius });
+        return { success: true, message: 'Local atualizado.' };
+      }
+      const id = `L${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyMMdd')}-${Utilities.getUuid().slice(0, 6).toUpperCase()}`;
+      appendRow('Locais', { id, nome: name, latitude, longitude, raio_metros: radius, ativo: true, criado_em: new Date().toISOString() });
+      return { success: true, message: 'Local cadastrado.', id };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 function toggleLocal(token, id) {
   try {
     requireAdmin(token);
-    const found = findRow('Locais', 'id', id);
-    if (!found) return { success: false, error: 'Local não encontrado.' };
-    const novoStatus = !found.obj.ativo;
-    updateRowAt('Locais', found.rowIndex, { ativo: novoStatus });
-    return { success: true, ativo: novoStatus };
-  } catch (e) {
-    return { success: false, error: e.message };
+    return withScriptLock(() => {
+      const found = findRow('Locais', 'id', id);
+      if (!found) return { success: false, error: 'Local não encontrado.' };
+      const ativo = !isActive(found.obj.ativo);
+      updateRowAt('Locais', found.rowIndex, { ativo });
+      return { success: true, ativo };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
-
-// ── Vínculos Funcionário ↔ Locais ────────────────────────────
 
 function getLocaisFuncionario(token, funcionarioId) {
   try {
     requireAdmin(token);
-    const vinculos = getData('FuncionarioLocais')
-      .filter(v => String(v.funcionario_id) === String(funcionarioId));
-    return { success: true, local_ids: vinculos.map(v => String(v.local_id)) };
-  } catch (e) {
-    return { success: false, error: e.message };
+    const ids = getData('FuncionarioLocais')
+      .filter(link => String(link.funcionario_id) === String(funcionarioId))
+      .map(link => String(link.local_id));
+    return { success: true, local_ids: ids };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 function setLocaisFuncionario(token, funcionarioId, locaisIds) {
   try {
     requireAdmin(token);
-    const sheet = getSheet('FuncionarioLocais');
-    if (sheet.getLastRow() > 1) {
-      const values = sheet.getDataRange().getValues();
-      const headers = values[0];
-      const fidIdx = headers.indexOf('funcionario_id');
-      for (let i = values.length - 1; i >= 1; i--) {
-        if (String(values[i][fidIdx]) === String(funcionarioId)) sheet.deleteRow(i + 1);
-      }
-    }
-    for (const localId of (locaisIds || [])) {
-      appendRow('FuncionarioLocais', { funcionario_id: funcionarioId, local_id: localId });
-    }
-    return { success: true, message: 'Locais atualizados!' };
-  } catch (e) {
-    return { success: false, error: e.message };
+    return withScriptLock(() => {
+      if (!findRow('Funcionarios', 'id', funcionarioId)) return { success: false, error: 'Funcionário não encontrado.' };
+      const validLocations = new Set(getData('Locais').map(location => String(location.id)));
+      const selected = [...new Set((locaisIds || []).map(String))];
+      if (selected.some(id => !validLocations.has(id))) return { success: false, error: 'Um dos locais selecionados é inválido.' };
+
+      const otherLinks = getData('FuncionarioLocais').filter(link => String(link.funcionario_id) !== String(funcionarioId));
+      const newLinks = selected.map(localId => ({ funcionario_id: funcionarioId, local_id: localId }));
+      replaceDataRows('FuncionarioLocais', otherLinks.concat(newLinks));
+      return { success: true, message: 'Locais atualizados.' };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
-
-// ── Relatório ─────────────────────────────────────────────────
 
 function getRelatorio(token, dataInicio, dataFim, funcionarioId, localId) {
   try {
     requireAdmin(token);
-    let registros = getData('Registros');
-    if (dataInicio) registros = registros.filter(r => String(r.timestamp) >= dataInicio);
-    if (dataFim)    registros = registros.filter(r => String(r.timestamp) <= dataFim + ' 23:59:59');
-    if (funcionarioId) registros = registros.filter(r => String(r.funcionario_id) === String(funcionarioId));
-    if (localId)    registros = registros.filter(r => String(r.local_id) === String(localId));
-    registros.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
-    return { success: true, registros: registros.slice(0, 500) };
-  } catch (e) {
-    return { success: false, error: e.message };
+    let records = filterRecords(getData('Registros'), dataInicio, dataFim);
+    if (funcionarioId) records = records.filter(record => String(record.funcionario_id) === String(funcionarioId));
+    if (localId) records = records.filter(record => String(record.local_id) === String(localId));
+    records.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    return { success: true, registros: records.slice(0, 500) };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
-
-// ── Configurações (via UI) ────────────────────────────────────
 
 function getConfiguracoes(token) {
   try {
     requireAdmin(token);
-    const configs = getData('Config');
-    const obj = {};
-    configs.forEach(c => { obj[c.chave] = c.valor; });
-    return { success: true, config: obj };
-  } catch (e) {
-    return { success: false, error: e.message };
+    return { success: true, config: Object.fromEntries(getData('Config').map(item => [item.chave, item.valor])) };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 function salvarConfiguracao(token, chave, valor) {
   try {
     requireAdmin(token);
-    const found = findRow('Config', 'chave', chave);
-    if (found) {
-      updateRowAt('Config', found.rowIndex, { valor: String(valor) });
-    } else {
-      appendRow('Config', { chave, valor: String(valor) });
+    const allowed = new Set(['sessao_duracao_horas', 'app_nome']);
+    if (!allowed.has(String(chave))) return { success: false, error: 'Configuração inválida.' };
+    let normalizedValue = String(valor || '').trim();
+    if (chave === 'sessao_duracao_horas') {
+      const hours = Number(normalizedValue);
+      if (!Number.isInteger(hours) || hours < 1 || hours > SESSION_HOURS_MAX) return { success: false, error: 'A duração deve estar entre 1 e 72 horas.' };
+      normalizedValue = String(hours);
+    } else if (!normalizedValue || normalizedValue.length > 80) {
+      return { success: false, error: 'Nome do app inválido.' };
     }
-    return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
+
+    return withScriptLock(() => {
+      const found = findRow('Config', 'chave', chave);
+      if (found) updateRowAt('Config', found.rowIndex, { valor: normalizedValue });
+      else appendRow('Config', { chave, valor: normalizedValue });
+      return { success: true };
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }

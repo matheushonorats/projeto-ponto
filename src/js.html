@@ -7,7 +7,7 @@
 const S = {
   token:    sessionStorage.getItem('pt_token') || null,
   user:     JSON.parse(sessionStorage.getItem('pt_user') || 'null'),
-  gps:      { lat: null, lng: null, watchId: null },
+  gps:      { lat: null, lng: null, accuracy: null, watchId: null },
   nextTypes:[], localAtivo: null,
   allFuncs: [], allLocais: [],
   map: null, mapMarker: null, mapCircle: null,
@@ -24,23 +24,24 @@ function api(fn, ...args) {
 document.addEventListener('DOMContentLoaded', async () => {
   tickClock(); setInterval(tickClock, 1000);
   try {
-    const fr = await api('checkFirstRun');
+    const [fr] = await Promise.all([api('checkFirstRun'), loadAppInfo()]);
     if (fr.firstRun) { show('setup'); return; }
     if (S.token) {
       const v = await api('validateToken', S.token);
-      if (v.valid) { enterApp(v.perfil, S.user?.nome); return; }
+      if (v.valid) { enterApp(v.perfil, v.nome); return; }
     }
   } catch(e) { /* offline or error — show login */ }
-  sessionStorage.clear(); S.token = null; S.user = null;
+  clearStoredSession(); S.token = null; S.user = null;
   show('login');
-  loadVersion();
 });
 
-async function loadVersion() {
-  // Show version in footer if available
+async function loadAppInfo() {
   try {
-    const v = typeof APP_VERSION !== 'undefined' ? APP_VERSION : null;
-    if (v) document.getElementById('app-version-login').textContent = 'v' + v;
+    const info = await api('getPublicAppInfo');
+    if (!info) return;
+    document.title = info.nome;
+    document.querySelectorAll('.auth-logo h1, .topbar-title').forEach(node => { node.textContent = info.nome; });
+    if (info.versao) document.getElementById('app-version-login').textContent = `v${info.versao}`;
   } catch(e) {}
 }
 
@@ -83,7 +84,7 @@ async function handleSetup() {
   try {
     const r = await api('criarAdminInicial', nome, email, senha);
     if (!r.success) { showMsg(errEl, r.error, 'error'); return; }
-    toast('✅ ' + r.message);
+    toast(r.message);
     show('login');
   } catch(e) { showMsg(errEl, 'Erro de conexão.', 'error'); }
   finally { setBtnLoading('btn-setup', false); }
@@ -109,9 +110,14 @@ async function handleLogin() {
 
 async function handleLogout() {
   if (S.token) await api('logout', S.token).catch(()=>{});
-  if (S.gps.watchId) navigator.geolocation.clearWatch(S.gps.watchId);
-  sessionStorage.clear(); Object.assign(S, { token:null, user:null, gps:{lat:null,lng:null,watchId:null} });
+  if (S.gps.watchId !== null) navigator.geolocation.clearWatch(S.gps.watchId);
+  clearStoredSession(); Object.assign(S, { token:null, user:null, gps:{lat:null,lng:null,accuracy:null,watchId:null} });
   show('login');
+}
+
+function clearStoredSession() {
+  sessionStorage.removeItem('pt_token');
+  sessionStorage.removeItem('pt_user');
 }
 
 /* ── Password ─────────────────────────────────────────────── */
@@ -125,7 +131,8 @@ async function handleAlterarSenha() {
     const r = await api('alterarSenha', S.token, atual, nova);
     if (!r.success) { showMsg(msgEl, r.error, 'error'); return; }
     showMsg(msgEl, r.message, 'success');
-    setTimeout(() => closeModal('modal-pw'), 1500);
+    if (r.requireLogin) setTimeout(handleLogout, 900);
+    else setTimeout(() => closeModal('modal-pw'), 1500);
   } catch(e) { showMsg(msgEl, 'Erro de conexão.', 'error'); }
 }
 
@@ -140,7 +147,7 @@ function initGPS() {
 let _lastGpsCall = 0;
 async function onGPSOk(pos) {
   const { latitude: lat, longitude: lng, accuracy: acc } = pos.coords;
-  S.gps.lat = lat; S.gps.lng = lng;
+  S.gps.lat = lat; S.gps.lng = lng; S.gps.accuracy = acc;
   const now = Date.now();
   // Throttle server calls to max 1 every 8s
   if (now - _lastGpsCall < 8000) { el('gps-acc').textContent = `±${Math.round(acc)}m`; return; }
@@ -190,15 +197,15 @@ async function registrarPonto(tipo) {
   setPunchBtns([]);
   showPunchFb('Registrando…', 'loading');
   try {
-    const r = await api('registrarPonto', S.token, tipo, S.gps.lat, S.gps.lng, navigator.userAgent);
+    const r = await api('registrarPonto', S.token, tipo, S.gps.lat, S.gps.lng, navigator.userAgent, S.gps.accuracy);
     if (r.success) {
-      showPunchFb(`✅ ${r.message}\n📍 ${r.local} · ${r.hora}`, 'success');
+      showPunchFb(`${r.message}\n${r.local} · ${r.hora}`, 'success');
       S.nextTypes = r.proximosTipos;
       setPunchBtns(r.proximosTipos);
       _lastGpsCall = 0; // force GPS status refresh
       if (S.gps.lat) onGPSOk({ coords: { latitude: S.gps.lat, longitude: S.gps.lng, accuracy: 0 } });
     } else {
-      showPunchFb(`❌ ${r.error}`, 'error');
+      showPunchFb(r.error, 'error');
       setPunchBtns(S.nextTypes);
     }
   } catch(e) {
@@ -240,7 +247,7 @@ async function loadHistorico() {
   list.innerHTML = '<p class="empty">Carregando…</p>';
   try {
     const r = await api('getMeusPontos', S.token, el('hist-ini').value, el('hist-fim').value);
-    if (!r.success) { list.innerHTML = `<p class="empty">${r.error}</p>`; return; }
+    if (!r.success) { list.innerHTML = `<p class="empty">${esc(r.error)}</p>`; return; }
     if (!r.registros.length) { list.innerHTML = '<p class="empty">Nenhum registro no período.</p>'; return; }
     list.innerHTML = r.registros.map(r => `
       <div class="record-item">
@@ -256,10 +263,7 @@ async function loadHistorico() {
 /* ══ ADMIN ══════════════════════════════════════════════════ */
 async function initAdmin() {
   adminSection('dashboard');
-  await loadDashboard();
-  await loadFuncsData();
-  await loadLocaisData();
-  loadConfiguracoes();
+  await Promise.all([loadDashboard(), loadFuncsData(), loadLocaisData(), loadConfiguracoes()]);
 }
 
 function adminSection(sec) {
@@ -297,13 +301,13 @@ function renderFuncs() {
     <tr>
       <td><strong>${esc(f.nome)}</strong></td>
       <td>${esc(f.email)}</td>
-      <td><span class="badge ${f.perfil==='admin'?'bg-blue':'bg-gray'}">${f.perfil}</span></td>
+      <td><span class="badge ${f.perfil==='admin'?'bg-blue':'bg-gray'}">${esc(f.perfil)}</span></td>
       <td><span class="badge ${f.ativo?'bg-green':'bg-red'}">${f.ativo?'Ativo':'Inativo'}</span></td>
-      <td><button class="btn ghost sm" onclick="openFuncModal('${f.id}',true)">Locais</button></td>
+      <td><button class="btn ghost sm" data-action="employee-locations" data-id="${escAttr(f.id)}">Locais</button></td>
       <td class="act-row">
-        <button class="btn secondary sm" onclick="openFuncModal('${f.id}')">Editar</button>
-        <button class="btn ghost sm" onclick="openResetPw('${f.id}','${esc(f.nome)}')">Senha</button>
-        <button class="btn ${f.ativo?'ghost':'primary'} sm" onclick="toggleFunc('${f.id}')">${f.ativo?'Desativar':'Ativar'}</button>
+        <button class="btn secondary sm" data-action="edit-employee" data-id="${escAttr(f.id)}">Editar</button>
+        <button class="btn ghost sm" data-action="reset-password" data-id="${escAttr(f.id)}" data-name="${escAttr(f.nome)}">Senha</button>
+        <button class="btn ${f.ativo?'ghost':'primary'} sm" data-action="toggle-employee" data-id="${escAttr(f.id)}">${f.ativo?'Desativar':'Ativar'}</button>
       </td>
     </tr>`).join('');
 }
@@ -319,7 +323,7 @@ async function openFuncModal(id = null, focusLocais = false) {
 
   // Locais checkboxes
   el('mf-locais').innerHTML = S.allLocais.filter(l=>l.ativo).map(l => `
-    <label class="chip-item"><input type="checkbox" name="mf-loc" value="${l.id}"> ${esc(l.nome)}</label>
+    <label class="chip-item"><input type="checkbox" name="mf-loc" value="${escAttr(l.id)}"> ${esc(l.nome)}</label>
   `).join('') || '<span class="empty">Nenhum local ativo cadastrado.</span>';
 
   if (id) {
@@ -360,7 +364,7 @@ async function salvarFuncionario() {
     const funcId = id || r.id;
     await api('setLocaisFuncionario', S.token, funcId, locais);
     closeFuncModal();
-    toast('✅ ' + r.message);
+    toast(r.message);
     loadFuncsData();
   } catch(e) { showMsg(msgEl, 'Erro ao salvar.', 'error'); }
 }
@@ -407,12 +411,12 @@ function renderLocais() {
   tb.innerHTML = S.allLocais.map(l => `
     <tr>
       <td><strong>${esc(l.nome)}</strong></td>
-      <td>${l.raio_metros}m</td>
+      <td>${Number(l.raio_metros)}m</td>
       <td style="font-family:monospace;font-size:.8rem">${Number(l.latitude).toFixed(6)}, ${Number(l.longitude).toFixed(6)}</td>
       <td><span class="badge ${l.ativo?'bg-green':'bg-red'}">${l.ativo?'Ativo':'Inativo'}</span></td>
       <td class="act-row">
-        <button class="btn secondary sm" onclick="openLocalModal('${l.id}')">Editar</button>
-        <button class="btn ${l.ativo?'ghost':'primary'} sm" onclick="toggleLocal('${l.id}')">${l.ativo?'Desativar':'Ativar'}</button>
+        <button class="btn secondary sm" data-action="edit-location" data-id="${escAttr(l.id)}">Editar</button>
+        <button class="btn ${l.ativo?'ghost':'primary'} sm" data-action="toggle-location" data-id="${escAttr(l.id)}">${l.ativo?'Desativar':'Ativar'}</button>
       </td>
     </tr>`).join('');
 }
@@ -453,9 +457,9 @@ function initMap() {
     setMapPin(lat, lng, parseInt(el('ml-raio').value) || 150);
   });
 
-  el('ml-raio').addEventListener('input', () => {
+  el('ml-raio').oninput = () => {
     if (S.mapCircle) S.mapCircle.setRadius(parseInt(el('ml-raio').value) || 150);
-  });
+  };
 }
 
 function setMapPin(lat, lng, raio) {
@@ -483,7 +487,7 @@ async function salvarLocal() {
     const r = await api('salvarLocal', S.token, { id, nome, latitude: lat, longitude: lng, raio_metros: raio });
     if (!r.success) { showMsg(msgEl, r.error, 'error'); return; }
     closeLocalModal();
-    toast('✅ ' + r.message);
+    toast(r.message);
     loadLocaisData();
   } catch(e) { showMsg(msgEl, 'Erro ao salvar.', 'error'); }
 }
@@ -498,8 +502,8 @@ async function toggleLocal(id) {
 /* ── Relatório ─────────────────────────────────────────────── */
 function fillRelatorioSelects() {
   const sf = el('rel-func'), sl = el('rel-local');
-  sf.innerHTML = '<option value="">Todos</option>' + S.allFuncs.map(f=>`<option value="${f.id}">${esc(f.nome)}</option>`).join('');
-  sl.innerHTML = '<option value="">Todos</option>' + S.allLocais.map(l=>`<option value="${l.id}">${esc(l.nome)}</option>`).join('');
+  sf.innerHTML = '<option value="">Todos</option>' + S.allFuncs.map(f=>`<option value="${escAttr(f.id)}">${esc(f.nome)}</option>`).join('');
+  sl.innerHTML = '<option value="">Todos</option>' + S.allLocais.map(l=>`<option value="${escAttr(l.id)}">${esc(l.nome)}</option>`).join('');
   if (!el('rel-ini').value) {
     el('rel-fim').value = isoDate(new Date());
     el('rel-ini').value = isoDate(new Date(Date.now() - 7*864e5));
@@ -511,7 +515,7 @@ async function loadRelatorio() {
   tb.innerHTML = '<tr><td colspan="4" class="empty">Carregando…</td></tr>';
   try {
     const r = await api('getRelatorio', S.token, el('rel-ini').value, el('rel-fim').value, el('rel-func').value, el('rel-local').value);
-    if (!r.success) { tb.innerHTML = `<tr><td colspan="4" class="empty">${r.error}</td></tr>`; return; }
+    if (!r.success) { tb.innerHTML = `<tr><td colspan="4" class="empty">${esc(r.error)}</td></tr>`; return; }
     if (!r.registros.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">Nenhum registro.</td></tr>'; return; }
     tb.innerHTML = r.registros.map(r => `
       <tr>
@@ -540,9 +544,12 @@ async function salvarConfiguracoes() {
     const sessao = el('cfg-sessao').value;
     const nome   = el('cfg-nome').value.trim();
     if (!sessao || parseInt(sessao) < 1) { showMsg(msgEl, 'Duração de sessão inválida.', 'error'); return; }
-    await api('salvarConfiguracao', S.token, 'sessao_duracao_horas', sessao);
-    if (nome) await api('salvarConfiguracao', S.token, 'app_nome', nome);
-    showMsg(msgEl, '✅ Configurações salvas!', 'success');
+    const requests = [api('salvarConfiguracao', S.token, 'sessao_duracao_horas', sessao)];
+    if (nome) requests.push(api('salvarConfiguracao', S.token, 'app_nome', nome));
+    const results = await Promise.all(requests);
+    const failure = results.find(result => !result.success);
+    if (failure) { showMsg(msgEl, failure.error, 'error'); return; }
+    showMsg(msgEl, 'Configurações salvas.', 'success');
   } catch(e) { showMsg(msgEl, 'Erro ao salvar.', 'error'); }
 }
 
@@ -553,8 +560,14 @@ function closeModal(id) { el(id).classList.add('hidden'); }
 /* ══ UTILS ══════════════════════════════════════════════════ */
 function el(id)      { return document.getElementById(id); }
 function cap(s)      { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
-function esc(s)      { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function isoDate(d)  { return d.toISOString().split('T')[0]; }
+function esc(s)      { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function escAttr(s)  { return esc(s).replace(/`/g,'&#96;'); }
+function isoDate(d)  {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
 
 function showMsg(el, msg, type) {
   el.textContent = msg; el.className = 'msg ' + type; el.classList.remove('hidden');
@@ -578,7 +591,7 @@ function toast(msg) {
 function togglePw(inputId, btn) {
   const inp = el(inputId);
   inp.type = inp.type === 'password' ? 'text' : 'password';
-  btn.textContent = inp.type === 'password' ? '👁' : '🙈';
+  btn.setAttribute('aria-label', inp.type === 'password' ? 'Mostrar senha' : 'Ocultar senha');
 }
 
 // Enter key on login/setup forms
@@ -586,5 +599,19 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Enter') return;
   if (!el('view-login').classList.contains('hidden')) handleLogin();
   if (!el('view-setup').classList.contains('hidden')) handleSetup();
+});
+
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const actions = {
+    'employee-locations': () => openFuncModal(button.dataset.id, true),
+    'edit-employee': () => openFuncModal(button.dataset.id),
+    'reset-password': () => openResetPw(button.dataset.id, button.dataset.name),
+    'toggle-employee': () => toggleFunc(button.dataset.id),
+    'edit-location': () => openLocalModal(button.dataset.id),
+    'toggle-location': () => toggleLocal(button.dataset.id),
+  };
+  if (actions[button.dataset.action]) actions[button.dataset.action]();
 });
 </script>
